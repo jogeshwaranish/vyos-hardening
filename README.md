@@ -1,169 +1,154 @@
-# vyos-hardening
+# vyos-hardening: CCDC edition
 
-One script that takes a **fresh VyOS router** (default config: `vyos`/`vyos` login, no firewall, SSH open on every interface) to a hardened baseline: deny-by-default firewall, SSH locked to keys and a management network, modern crypto, brute-force protection, and kernel anti-spoofing settings.
+A defense toolkit for the **VyOS router in a CCDC-style competition**. It assumes three things that a normal hardening script doesn't:
 
-Targets **VyOS 1.4 (Sagitta LTS)** and **1.5 / rolling**. It uses the new firewall syntax (`firewall ipv4 input filter`), so it **will not work on 1.3 or older**.
+1. **The box is already compromised.** Images are handed out with planted users, keys, scheduled tasks and backdoors, so finding persistence comes before hardening.
+2. **Scored services must stay up.** A deny-all firewall that breaks the web server costs more points than the red team does. The firewall is built *around* the services in your team packet.
+3. **You'll break something under pressure.** Every config change arms a **dead-man rollback timer**. If you lose access or kill scoring, it reverts on its own in N minutes, without a reboot.
+
+Targets **VyOS 1.4 (Sagitta) and newer**. `audit`, `backup`, `creds` and `purge` mostly work on older builds. `harden` needs the 1.4 firewall syntax and refuses to run on 1.3.
 
 ---
 
-## Quick start
+## Setup (before the competition)
 
 ```bash
-# 1. Copy the script and your public key to the router
-scp harden-vyos.sh ~/.ssh/id_ed25519.pub vyos@192.168.0.1:
-
-# 2. On the router (operational mode, NOT sudo). Do a dry run first:
-vbash harden-vyos.sh \
-  --wan eth0 \
-  --lan eth1 --lan eth1.10 \
-  --mgmt-net 192.168.0.0/24 \
-  --admin-user anish --pubkey-file ~/id_ed25519.pub \
-  --ssh-listen 192.168.0.1 \
-  --dry-run
-
-# 3. Same command without --dry-run to apply (commits, does NOT save)
-# 4. From a NEW terminal:  ssh anish@192.168.0.1   -> works? then on the router:
-configure; save; exit
-
-# 5. Optional, logged in as the new user: remove the default 'vyos' account
-vbash harden-vyos.sh <same args> --remove-default-user --save --force
+git clone https://github.com/jogeshwaranish/vyos-hardening
+cp ccdc.conf.example ccdc.conf      # fill in from the team packet at drop
 ```
 
-### Options
+Getting it onto the router at drop time (pick whatever the rules allow):
 
-| Flag | Required | Meaning |
-|---|---|---|
-| `--wan IFACE` | yes | Untrusted/internet-facing interface |
-| `--lan IFACE` | yes, repeatable | Trusted interfaces (VLAN subinterfaces such as `eth1.10` work) |
-| `--mgmt-net CIDR` | yes, repeatable | IPv4 networks allowed to SSH to the router |
-| `--mgmt-net6 CIDR` | repeatable | IPv6 networks allowed to SSH |
-| `--admin-user NAME` | | Creates a key-only admin account |
-| `--pubkey-file PATH` | | OpenSSH public key. If given, **SSH password login is disabled**. Without `--admin-user` the key goes to whoever is running the script |
-| `--ssh-listen ADDR` | repeatable | Bind sshd only to these router addresses |
-| `--ssh-port PORT` | | Default `22` |
-| `--banner TEXT` | | Pre-login banner |
-| `--remove-default-user` | | Deletes `vyos`. Refuses to run if you're logged in as `vyos` |
-| `--save` | | Saves after commit. Off by default so a reboot undoes a lockout |
-| `--force` | | Run even if an IPv4 input filter already exists (rules are merged) |
-| `--dry-run` | | Print every `set`/`delete` command and change nothing |
+```bash
+scp ccdc-vyos.sh ccdc.conf vyos@ROUTER:      # if you have a jump box
+# or paste it: on the router run  cat > ccdc-vyos.sh  , paste, Ctrl-D
+chmod +x ccdc-vyos.sh
+```
+
+> Check your competition's rules on pre-written scripts and internet access. Some regionals require tooling to be typed in or allow only public repos.
 
 ---
 
-## What it does, section by section
+## The first 15 minutes
 
-### 0. Safety checks (before any change)
-- Refuses to run as root/sudo, since VyOS config commands must run as a config-group user.
-- Refuses to run without `--mgmt-net`, because the input firewall would drop your SSH session.
-- Refuses to disable password auth unless a public key is actually installed for a user.
-- Refuses `--remove-default-user` while you're logged in as `vyos`.
-- Aborts if an input firewall already exists, so it won't silently stack rules on top of yours (`--force` overrides).
-- Copies `/config/config.boot` to `/config/config.boot.pre-hardening-<timestamp>`.
-- **Warns** (never deletes) if `telnet`, `snmp`, `https` (the API), `lldp`, `upnp`, `mdns` or `broadcast-relay` are enabled.
+| # | Command | Time | Why this order |
+|---|---|---|---|
+| 1 | `./ccdc-vyos.sh backup` | 5 s | Known-good snapshot of the config as handed to you |
+| 2 | `./ccdc-vyos.sh creds` | 1 min | Red team already has the default creds. **Lock them out first** |
+| 3 | `./ccdc-vyos.sh audit` | 30 s | Find what they planted. Read the `[!]` lines |
+| 4 | `./ccdc-vyos.sh purge` | 2–5 min | Remove what audit found, item by item |
+| 5 | **check scoreboard** → `./ccdc-vyos.sh confirm` | | Purge armed the rollback timer |
+| 6 | `./ccdc-vyos.sh harden` | 1 min | Rebuild the firewall around scored services |
+| 7 | **check scoreboard + SSH from a new terminal** → `./ccdc-vyos.sh confirm` | | |
+| ∞ | `./ccdc-vyos.sh status` / `block <ip>` | | Watch drops, ban attackers |
 
-### 1. Firewall groups
-| Group | Contents | Why |
-|---|---|---|
-| `interface-group WAN` | `--wan` | Rules say "from WAN" instead of hard-coding `eth0` |
-| `interface-group LAN` | every `--lan` | Adding a VLAN later = one `set` into the group |
-| `network-group MGMT-v4` / `ipv6-network-group MGMT-v6` | `--mgmt-net(6)` | Who can manage the box |
+`creds` saves right away, because you never want a red-team reboot to bring the default password back. `purge` and `harden` commit but **don't save** until you `confirm`.
 
-### 2. Kernel / IP stack (`firewall global-options` → sysctls)
-| Setting | Value | Defends against |
-|---|---|---|
-| `broadcast-ping` | disable | Smurf amplification (answering pings sent to broadcast) |
-| `ip-src-route`, `ipv6-src-route` | disable | Source-routed packets that dictate their own path past your filters |
-| `receive-redirects`, `ipv6-receive-redirects` | disable | Forged ICMP redirects that rewrite the routing table (MITM) |
-| `send-redirects` | disable | A router has no reason to send these, and they leak topology |
-| `log-martians` | enable | Logs packets with impossible source addresses (spoofing signal) |
-| `source-validation` | **strict** | Reverse-path filter: drops packets whose source wouldn't be routed back out the interface they came in on |
-| `syn-cookies` | enable | Keeps accepting connections during a SYN flood |
-| `twa-hazards-protection` | enable | RFC 1337 TIME-WAIT assassination |
-| `all-ping` | enable | Kept on for troubleshooting; actual ping access is rate-limited in the filters |
+---
 
-> ⚠️ **Strict RPF breaks asymmetric routing** (multi-WAN, policy routing, or a firewall VM that routes back through a different interface). If traffic mysteriously drops, set `source-validation loose`.
+## Commands
 
-### 3. Global state policy
-`established` and `related` → **accept**, `invalid` → **drop**, applied to every hook (input/forward/output, IPv4 and IPv6). Return traffic for connections you started just works, and malformed/out-of-state packets die before rule evaluation.
+### `backup`
+Copies `/config/config.boot` and `show configuration commands` to `/config/ccdc/backup-<time>.{boot,cmds}` and points `last-backup.boot` at it. Every config-changing command runs this first automatically.
 
-### 4. IPv4 input (traffic *to* the router). Default: **drop**
-| Rule | Allows |
+### `audit` (read-only)
+Prints a report and saves it to `/config/ccdc/audit-<time>.txt`, with a full config dump next to it for the incident report. `[!]` marks a finding.
+
+| Section | What it looks for |
 |---|---|
-| 10 | Loopback (local services talking to each other) |
-| 20 | SSH on `--ssh-port`, **only** from `MGMT-v4` **and** only arriving on a LAN interface |
-| 30 | Ping from LAN, 10/s |
-| 31 | Ping from WAN, 2/s (reachability without becoming a flood target) |
-| 40 | DNS (53 tcp/udp) from LAN, for `service dns forwarding` |
-| 50 | DHCP (udp 67) from LAN, for `service dhcp-server` |
-| 60 | NTP (udp 123) from LAN |
-| 990 | Everything else from WAN: **logged** and dropped |
-| default | Drop |
+| **1. Accounts (config)** | Every `system login user`, whether it has SSH keys (any key you didn't add is a backdoor), users not in `KEEP_USERS`, RADIUS/TACACS servers (an auth server the red team controls = universal password) |
+| **2. Accounts (OS)** | Non-root UID 0 accounts, OS users with a shell that aren't in the VyOS config (added with `useradd`, invisible to `show configuration`), sudoers entries, every `authorized_keys` file with key comments, who's logged in now, recent logins |
+| **3. Triggered execution** | `system task-scheduler` (VyOS cron), `service event-handler` (runs a script when a log line matches, so a red-team-triggerable backdoor), `container`, `commit-archive` (uploads your config to a remote URL on every commit), non-empty `vyos-pre/postconfig-bootup.script`, commit hooks in `/config/scripts/commit/` (run on **every** commit, including yours), cron, `ld.so.preload` (userland rootkit), `rc.local`, custom systemd units and timers |
+| **4. Files changed vs stock image** | VyOS runs from a read-only squashfs and every change lives in an overlay directory. The script lists everything in that overlay, so you see exactly what was modified on the image, however old. Changed binaries, PAM or sshd files get flagged |
+| **5. Network redirection** | Destination NAT (a port forward to an attacker host?), source NAT, static/dynamic/policy routes, tunnel interfaces (WireGuard/OpenVPN/GRE/VXLAN = covert channels), DNS forwarding overrides and static host mappings (DNS hijack), remote syslog targets, custom sysctls |
+| **6. Management services** | telnet, the HTTPS API (and its keys), SNMP communities, UPnP, LLDP, the full SSH config |
+| **7. Firewall as found** | The whole existing ruleset, hooks people forget (output, prerouting/raw, bridge), `invalid` traffic set to accept, nftables tables VyOS didn't create |
+| **8. Live state** | Listening sockets with owning process, established connections, suspicious processes (`nc`, `socat`, `bash -i`, `/dev/tcp`, `python -c`, anything running from `/tmp` or `/dev/shm`, known C2 names), executables in tmp dirs, promiscuous interfaces (sniffers), addresses, routes, `ip rule` |
 
-Rules 40–60 are harmless if the matching service isn't enabled, since nothing is listening.
+### `creds`
+1. Prompts for a new password (twice, 12+ characters) for every user in `KEEP_USERS`.
+2. **Deletes every SSH key** on those users. Pre-planted keys are the #1 VyOS backdoor. If `TEAM_PUBKEY` is set, it adds that back.
+3. Offers to delete every user **not** in `KEEP_USERS`, one at a time. It never deletes you, and it refuses to run if you aren't in `KEEP_USERS`.
+4. Offers to remove RADIUS/TACACS.
+5. Commits and **saves**.
+6. Offers to **kill every other login session**. Changing a password doesn't end shells that are already open, so this step is what actually kicks the red team out.
 
-### 5. IPv4 forward (traffic *through* the router). Default: **drop**
-- 100: anything entering on a LAN interface may go anywhere.
-- 990: unsolicited WAN→inside is logged and dropped. Replies to LAN traffic pass via the state policy.
-- Port forwards or inter-VLAN restrictions? Add rules between 100 and 990.
+### `purge`
+Walks each persistence location and asks `y/N` per item, showing the item's config first:
+- **Config:** task-scheduler tasks, event handlers, containers, DNAT rules, WireGuard/OpenVPN/GRE interfaces, static host mappings, DNS overrides, remote syslog, telnet, HTTPS API, SNMP, UPnP, commit-archive, RADIUS/TACACS.
+- **Filesystem:** boot scripts (reset to empty), commit hooks, files changed from the stock image in cron/systemd/profile/bashrc/`/usr/local/bin`/`ld.so.preload`, `authorized_keys` files. Files are **quarantined** to `/config/ccdc/quarantine/` with mode 000, not deleted, so you keep the evidence for the incident report inject.
+- **Processes:** offers `kill -9` on suspicious processes.
 
-### 6. IPv6 input and forward. Default: **drop**
-Same policy as IPv4, plus:
-- **ICMPv6 allowed.** IPv6 can't work without Neighbor Discovery, Router Advertisements and Path-MTU messages, so blocking ICMPv6 the way people block ICMPv4 breaks it.
-- DHCPv6 client replies (udp 547→546), so a WAN DHCPv6/PD lease keeps working.
-- SSH only if `--mgmt-net6` is set.
+Arms the rollback timer at the end. **DNAT rules are often scored services.** Only delete the ones that point somewhere that isn't in your packet.
 
-### 7. SSH daemon
-| Setting | Effect |
+### `harden`
+Shows the plan, asks once, backs up, then **wipes the existing filter chains** (`input`, `forward`, `output`, every named chain and the zone firewall, which takes any red-team allow rules with them) and rebuilds:
+
+**Groups:** `WAN`, `LAN` (interfaces), `MGMT-v4` (admin networks), `SCORING` (scoring engine IPs), `BLOCKLIST` (persists across re-runs so bans aren't lost).
+
+**Input (traffic to the router). Default drop.**
+
+| Rule | |
 |---|---|
-| `listen-address` | sshd binds only to the addresses you give (not the WAN IP). Defence in depth on top of the firewall |
-| `disable-password-authentication` | Keys only, so password brute-force is impossible (only when a key is supplied) |
-| `dynamic-protection` (sshguard) | Blocks IPs that rack up failed-login score 30 within 30 min: first ban 300 s, growing ×1.5 on repeat. Your `--mgmt-net`s are allow-listed so you can't ban yourself |
-| `ciphers`/`cipher` | `chacha20-poly1305`, `aes256-gcm`, `aes128-gcm`, `aes256-ctr`. Removes CBC and 3DES |
-| `mac` | Encrypt-then-MAC SHA-2 / UMAC-128 only. Removes MD5, SHA-1 and non-ETM MACs |
-| `key-exchange` | `curve25519`, DH group 16/18. Removes group1/group14-sha1 and NIST curves |
-| `disable-host-validation` | No reverse-DNS lookup on login (faster, no DNS dependency) |
-| `client-keepalive-interval 300` | Detects dead sessions |
+| 5 | Drop + log anything from `BLOCKLIST` |
+| 10 | Loopback |
+| 20 | SSH only from `MGMT_NETS`, only arriving on LAN. **Never from WAN** |
+| 30/31 | Ping from LAN, and from WAN at 5/s |
+| 40/50/60 | DNS / DHCP / NTP from LAN, if the router provides them (`ROUTER_SERVES_*`) |
+| 999 | Log + drop |
 
-The script auto-detects whether your VyOS build calls the cipher node `ciphers` (1.4) or `cipher` (newer).
+**Forward (traffic through the router). Default drop.**
 
-### 8. Accounts
-- Creates `--admin-user` with your public key (VyOS 1.4+ has no privilege levels, so every user is an admin).
-- `--remove-default-user` deletes `vyos`, the account every scanner tries with password `vyos`.
-- The new user has **no password**, which means no console login. For console access (you want this for recovery), set one manually:
-  `set system login user anish authentication plaintext-password '<strong-password>'`
+| Rule | |
+|---|---|
+| 5/6 | Drop + log to/from `BLOCKLIST` (6 catches internal hosts calling home to C2) |
+| 10 | Scoring engine IPs: always accepted |
+| 100+ | One rule per `SCORED_SERVICES` entry (internal IP + ports, from anywhere) |
+| 200 | LAN ↔ LAN |
+| 300–302 | Egress: if `restricted`, only `EGRESS_TCP`/`EGRESS_UDP` ports and ICMP leave the network |
+| 390 | **Log + drop all other egress.** This is what stops reverse shells and beacons from compromised internal boxes |
+| 999 | Log + drop |
 
-### 9. Miscellaneous (applied only if the node exists in your version)
-- Pre-login legal banner.
-- `system option ctrl-alt-delete ignore`: someone at the hypervisor console can't reboot it with a keystroke.
-- `system login timeout 900`: idle shells log out after 15 minutes.
-- `system ip disable-directed-broadcast`.
+**IPv6:** `block` (default) drops all routed IPv6. The red team uses v6 because teams forget it. ICMPv6 to the router stays open so neighbor discovery still works. `passthrough` mirrors the IPv4 LAN-out policy.
+
+**Kernel:** no source routing, no ICMP redirects (sent or received), no broadcast ping, SYN cookies, martian logging, RFC 1337 protection, **loose** reverse-path filtering (strict breaks the asymmetric routing common in CCDC topologies), established/related accept, invalid drop.
+
+**SSH:** listens on all addresses (the firewall does the restricting). sshguard bans after repeated failures (allow-listing your admin networks and the scoring engine). Modern ciphers/MACs/KEX only. 60 s keepalive. Password auth is disabled only if `TEAM_PUBKEY` is set.
+
+**Misc:** login banner, idle shells log out after 15 min, Ctrl-Alt-Del ignored.
+
+### `confirm`
+Cancels the rollback timer and saves. Run it **only** after you've checked the scoreboard and SSH'd in from a *new* terminal.
+
+### `rollback [file]`
+Loads `last-backup.boot` (or the file you give it) and commits immediately, with no reboot.
+
+### `block IP [IP...]` / `unblock IP [IP...]`
+Adds IPs (or `a.b.c.d-e.f.g.h` ranges) to `BLOCKLIST`, commits, saves, and **flushes their existing connections** with `conntrack -D`. The state policy accepts established traffic before any rule runs, so without the flush an attacker's open shell would survive the block. It refuses to block scoring engine IPs. Know your competition's rules on blocking.
+
+### `status`
+Rollback timer state, the current blocklist, the last 20 firewall log lines, logged-in users.
 
 ---
 
-## What it deliberately does *not* do
-- **No NAT, DHCP or DNS config.** It hardens the router; it doesn't build your network.
-- **No deleting of existing services.** It warns, and you decide.
-- **No inter-VLAN segmentation.** All `--lan` interfaces trust each other. For a lab with untrusted VLANs (IoT, a malware sandbox), add forward rules or move to `firewall zone`.
-- **No remote syslog.** The syntax changed between 1.4 and 1.5. Add `system syslog` yourself to ship logs to your SIEM/NIDS box.
-- **No SNMP, flow export or auth server (RADIUS/TACACS).**
+## How the rollback timer works
+`purge` and `harden` write `/tmp/ccdc-deadman.sh`, which sleeps `ROLLBACK_MINUTES`, then runs `load <backup>; commit`. It starts detached (`setsid nohup`), so it survives your SSH session dying, which is the exact failure it exists for. `confirm` kills it. Unlike VyOS's built-in `commit-confirm`, which reboots by default, it doesn't reboot the router, so scored traffic doesn't drop for the length of a boot.
 
-## Verifying
-```bash
-show firewall                       # rulesets + hit counters
-show firewall ipv4 input filter
-show log firewall                   # rules 990 (WAN drops) land here
-show configuration commands | match ssh
-sudo sshd -T | egrep 'ciphers|macs|kexalgorithms|passwordauthentication'
-```
-From outside: `nmap -Pn -p- <WAN-IP>` should show everything filtered. `ssh -o PubkeyAuthentication=no user@router` should be refused.
+## Safety details
+- Must run as a VyOS admin user. It re-executes itself under the `vyattacfg` group, and refuses root/sudo (that corrupts VyOS config sessions).
+- If any `set` fails, nothing is committed.
+- Config node names are read without `eval`. Names on a compromised box are attacker-controlled, so a user named `$(rm -rf /)` is just printed.
+- `ASSUME_YES=1 ./ccdc-vyos.sh <cmd>` answers yes to every prompt. It's for testing; **don't** use it with `purge`.
 
-## Rollback
-```bash
-# Not yet saved?   just reboot.
-# Already saved:
-configure
-load /config/config.boot.pre-hardening-<timestamp>
-commit; save; exit
-```
+## Files
+| File | |
+|---|---|
+| `ccdc-vyos.sh` | The toolkit |
+| `ccdc.conf.example` | Every setting, commented. Copy to `ccdc.conf` (git-ignored) |
+| `/config/ccdc/` on the router | Backups, audit reports, quarantine, rollback log (survives reboot) |
+
+## Tested?
+Logic was tested against a stubbed VyOS CLI (command generation, input validation, prompts, rollback-timer lifecycle). **Run it on your homelab VyOS before competition day.** Practice the whole first-15-minutes sequence on a deliberately backdoored VM.
 
 ## License
 MIT

@@ -1,0 +1,54 @@
+# ccdc.conf — fill this in from the team packet BEFORE you touch the router.
+# Copy to ccdc.conf next to ccdc-vyos.sh (or pass -c /path/to/ccdc.conf).
+# Plain bash syntax. Arrays use ( "a" "b" ).
+
+# --- Topology ----------------------------------------------------------------
+WAN_IF="eth0"                         # faces the scoring engine / red team
+LAN_IFS=( "eth1" )                    # every internal interface/VLAN (eth1.10 ...)
+
+# Networks allowed to SSH to the router (your team's admin workstations/subnet)
+MGMT_NETS=( "10.0.1.0/24" )
+
+# --- Scoring -----------------------------------------------------------------
+# Scoring engine source IPs. Always allowed through the forward filter,
+# never blockable with `block`. Leave empty if the packet doesn't give them.
+SCORING_ENGINE_IPS=( )
+
+# Scored services reachable FROM THE WAN: "proto internal-ip ports"
+#   proto: tcp | udp | tcp_udp      ports: single, list (80,443) or range (5000-5010)
+# Use the INTERNAL (post-DNAT) address. Forward filtering happens after DNAT.
+SCORED_SERVICES=(
+  "tcp     10.0.1.10  80,443"        # web
+  "tcp_udp 10.0.1.20  53"            # dns
+  "tcp     10.0.1.30  25,110,143"    # mail
+)
+
+# --- Egress (internal hosts -> internet) -------------------------------------
+# restricted = only the ports below leave the network (kills most reverse shells/C2)
+# open       = LAN may reach anything outbound
+EGRESS_MODE="restricted"
+EGRESS_TCP="53,80,443"
+EGRESS_UDP="53,123"
+
+# --- IPv6 --------------------------------------------------------------------
+# block       = drop all routed IPv6 (red team likes v6 when teams forget it)
+# passthrough = same policy as IPv4 for LAN->out; ICMPv6 allowed
+IPV6_MODE="block"
+
+# --- Router-local services offered to LAN ------------------------------------
+ROUTER_SERVES_DNS="yes"               # allow LAN -> router udp/tcp 53
+ROUTER_SERVES_DHCP="yes"              # allow LAN -> router udp 67
+ROUTER_SERVES_NTP="no"
+
+# --- Accounts ----------------------------------------------------------------
+# Users that should exist after `creds`. Anyone else gets offered for deletion.
+KEEP_USERS=( "vyos" )
+# Optional team SSH public key (one line). If set, SSH password auth is DISABLED.
+# Leave empty if you'll be logging in with passwords (typical at CCDC).
+TEAM_PUBKEY=""
+
+SSH_PORT="22"
+
+# --- Safety ------------------------------------------------------------------
+ROLLBACK_MINUTES="5"                  # dead-man timer after harden/purge
+REPORT_DIR="/config/ccdc"             # survives reboot
