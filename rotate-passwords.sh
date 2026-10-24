@@ -26,8 +26,13 @@ for u in "${users[@]}"; do
     echo "failed to set password for $u" >&2
   fi
 done
-commit && save >/dev/null
-exit   # in VyOS scripts this closes the config session
+if ! commit; then
+  exit   # in VyOS scripts this closes the config session
+  echo "commit failed, no passwords were changed" >&2
+  builtin exit 1
+fi
+save >/dev/null
+exit
 
 printf '\n%-16s %s\n' USER PASSWORD
 printf '%s\n' "${out[@]}" | awk '{printf "%-16s %s\n", $1, $2}'
